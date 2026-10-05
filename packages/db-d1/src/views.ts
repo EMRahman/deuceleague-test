@@ -1,0 +1,180 @@
+import type { D1Database, D1Result } from "@cloudflare/workers-types";
+import { readIdentity, type CredentialKind } from "./identity.js";
+import { readLeague } from "./league.js";
+import type { MatchFormat } from "@deuceleague/schema";
+import type { LedgerMatch } from "./view-types.js";
+
+type Row = Record<string, unknown>;
+const string = (v: unknown) => v === null ? null : String(v);
+const number = (v: unknown) => v === null ? null : Number(v);
+
+/** Fixed SQL shared by normal table reads and previous-competition placement reads. */
+export function ledgerRead(db: D1Database, competitionId: string | null, entryId: string | null = null, previousOf: string | null = null) {
+  return db.prepare(`SELECT m.id, m.division_id, m.status, m.outcome, m.winning_side, m.retired_side, m.score,
+    s0.entry_id AS side0, s1.entry_id AS side1 FROM match m
+    LEFT JOIN match_side s0 ON s0.match_id = m.id AND s0.side_index = 0
+    LEFT JOIN match_side s1 ON s1.match_id = m.id AND s1.side_index = 1
+    WHERE m.competition_id = coalesce(?, (SELECT competition_id FROM entry WHERE id = ?),
+      (SELECT previous_competition_id FROM competition WHERE id = ?)) ORDER BY m.id`).bind(competitionId, entryId, previousOf);
+}
+export function ledgerRecords(result: D1Result): LedgerMatch[] {
+  return (result.results as Row[]).map((r) => ({ id: String(r.id), divisionId: string(r.division_id), side0: string(r.side0), side1: string(r.side1),
+    status: String(r.status), outcome: string(r.outcome), winningSide: number(r.winning_side), retiredSide: number(r.retired_side),
+    score: r.score === null ? null : JSON.parse(String(r.score)) }));
+}
+
+/** League structure, accepted ledger, credential and clock from one snapshot. */
+export async function readLeagueViews(db: D1Database, hash: string, kind: CredentialKind, query: { competitionId: string } | { entryId: string }) {
+  const snapshot = await readLeague(db, hash, kind, query, [
+    ledgerRead(db, "competitionId" in query ? query.competitionId : null, "entryId" in query ? query.entryId : null),
+    db.prepare("SELECT timezone FROM club WHERE singleton = 1"),
+  ]);
+  return { ...snapshot, ledger: ledgerRecords(snapshot.extraResults[0]!), timezone: String((snapshot.extraResults[1]!.results[0] as Row).timezone) };
+}
+
+/** No email or phone leaves D1 without the requesting live key's PII scope in this snapshot.
+ * Aggregate only outstanding matches; duplicates in waiting_on are intentional.
+ * Only the running season's competitions that are not closed appear: a finished season's loose ends
+ * cannot be settled, so nothing would ever clear them. They are found from their outstanding matches
+ * and then by key. A match against a withdrawn entry, or one whose members have all left or been
+ * removed (a doubles pair with one partner still in the club stays), is outstanding for no one: it
+ * cannot be played, so neither side is chased for it, and it returns if the entry does.
+ */
+export async function readChase(db: D1Database, hash: string, kind: CredentialKind, competitionId?: string) {
+  const identity = await readIdentity(db, hash, kind, null, [
+    db.prepare(`WITH sides AS (
+      SELECT m.competition_id, c.name AS competition_name, m.division_id, d.name AS division_name, d.ordinal,
+        season.results_deadline_at, cl.timezone, em.member_id,
+        (SELECT label FROM entry_label WHERE entry_id = other.entry_id) AS opponent_label,
+        own.entry_id,
+        EXISTS (SELECT 1 FROM result_submission r WHERE r.match_id = m.id AND r.side_index = own.side_index AND r.state = 'pending') AS claimed,
+        EXISTS (SELECT 1 FROM result_submission r WHERE r.match_id = m.id AND r.side_index <> own.side_index AND r.state = 'pending') AS opponent_claimed
+      FROM match m JOIN competition c ON c.id = m.competition_id JOIN season ON season.id = c.season_id
+      JOIN club cl ON cl.id = m.club_id LEFT JOIN division d ON d.id = m.division_id
+      JOIN match_side own ON own.match_id = m.id JOIN entry_member em ON em.entry_id = own.entry_id
+      LEFT JOIN match_side other ON other.match_id = m.id AND other.side_index <> own.side_index
+      WHERE m.status IN ('open', 'reported', 'disputed') AND (? IS NULL OR m.competition_id = ?)
+        AND c.state NOT IN ('complete', 'archived') AND season.state = 'active'
+        AND NOT EXISTS (SELECT 1 FROM match_side gone JOIN entry ge ON ge.id = gone.entry_id
+          WHERE gone.match_id = m.id AND (ge.state = 'withdrawn' OR (
+            EXISTS (SELECT 1 FROM entry_member gm WHERE gm.entry_id = ge.id)
+            AND NOT EXISTS (SELECT 1 FROM entry_member gm JOIN member gmb ON gmb.id = gm.member_id
+              WHERE gm.entry_id = ge.id AND gmb.status = 'active' AND gmb.deleted_at IS NULL))))
+    ), permission AS (
+      SELECT EXISTS (SELECT 1 FROM api_key k, json_each(k.scopes) s WHERE k.key_hash = ? AND k.revoked_at IS NULL
+        AND (k.expires_at IS NULL OR k.expires_at > unixepoch('subsec') * 1000) AND s.value = 'members:pii') AS pii
+    ) SELECT sides.competition_id, sides.competition_name, sides.division_id, sides.division_name, sides.ordinal,
+      sides.results_deadline_at, sides.timezone, mb.id AS member_id, mb.display_name,
+      CASE WHEN permission.pii THEN json_object('email', mb.email, 'phone', mb.phone) ELSE NULL END AS personal_json,
+      count(*) AS outstanding_matches,
+      sum(NOT claimed AND NOT opponent_claimed) AS needs_playing,
+      sum(opponent_claimed) AS awaiting_you,
+      sum(claimed AND NOT opponent_claimed) AS awaiting_them,
+      json_group_array(opponent_label ORDER BY opponent_label) AS waiting_on,
+      sides.entry_id
+    FROM sides JOIN member mb ON mb.id = sides.member_id AND mb.deleted_at IS NULL CROSS JOIN permission
+    GROUP BY sides.competition_id, sides.division_id, mb.id
+    ORDER BY outstanding_matches DESC, mb.display_name, sides.ordinal`).bind(competitionId ?? null, competitionId ?? null, hash),
+    // What the tables are counted from, for each competition with a match outstanding:
+    // how many each entry has played toward the minimum is the engine's to say.
+    db.prepare(`SELECT c.id, c.rules, c.match_format FROM competition c
+      WHERE c.id IN (SELECT m2.competition_id FROM match m2 JOIN competition c2 ON c2.id = m2.competition_id
+        JOIN season s2 ON s2.id = c2.season_id
+        WHERE m2.status IN ('open', 'reported', 'disputed') AND c2.state NOT IN ('complete', 'archived') AND s2.state = 'active')
+        AND (? IS NULL OR c.id = ?)`).bind(competitionId ?? null, competitionId ?? null),
+    db.prepare(`SELECT e.id, e.competition_id, e.division_id, e.state,
+      (SELECT label FROM entry_label WHERE entry_id = e.id) AS label FROM entry e
+      WHERE e.competition_id IN (SELECT m2.competition_id FROM match m2 JOIN competition c2 ON c2.id = m2.competition_id
+        JOIN season s2 ON s2.id = c2.season_id
+        WHERE m2.status IN ('open', 'reported', 'disputed') AND c2.state NOT IN ('complete', 'archived') AND s2.state = 'active')
+        AND (? IS NULL OR e.competition_id = ?) AND EXISTS (SELECT 1 FROM entry_member em WHERE em.entry_id = e.id)`)
+      .bind(competitionId ?? null, competitionId ?? null),
+    db.prepare(`SELECT m.id, m.competition_id, m.division_id, m.status, m.outcome, m.winning_side, m.retired_side, m.score,
+      s0.entry_id AS side0, s1.entry_id AS side1 FROM match m
+      LEFT JOIN match_side s0 ON s0.match_id = m.id AND s0.side_index = 0
+      LEFT JOIN match_side s1 ON s1.match_id = m.id AND s1.side_index = 1
+      WHERE m.competition_id IN (SELECT m2.competition_id FROM match m2 JOIN competition c2 ON c2.id = m2.competition_id
+        JOIN season s2 ON s2.id = c2.season_id
+        WHERE m2.status IN ('open', 'reported', 'disputed') AND c2.state NOT IN ('complete', 'archived') AND s2.state = 'active')
+        AND (? IS NULL OR m.competition_id = ?) ORDER BY m.id`)
+      .bind(competitionId ?? null, competitionId ?? null),
+  ]);
+  const rows = (identity.extraResults[0]!.results as Row[]).map((r) => ({
+    competitionId: String(r.competition_id), competitionName: String(r.competition_name),
+    divisionId: r.division_id as string, divisionName: r.division_name as string, divisionOrdinal: Number(r.ordinal ?? 0),
+    memberId: String(r.member_id), displayName: String(r.display_name),
+    ...(r.personal_json === null ? {} : JSON.parse(String(r.personal_json)) as { email: string | null; phone: string | null }),
+    outstandingMatches: Number(r.outstanding_matches), needsPlaying: Number(r.needs_playing), awaitingYou: Number(r.awaiting_you), awaitingThem: Number(r.awaiting_them),
+    deadline: r.results_deadline_at === null ? null : new Date(Number(r.results_deadline_at)), timezone: String(r.timezone),
+    waitingOn: JSON.parse(String(r.waiting_on)) as string[],
+    entryId: String(r.entry_id),
+  }));
+  const [, competitions, entries, matches] = identity.extraResults.map((r) => r.results as Row[]);
+  return {
+    identity, rows,
+    competitions: competitions!.map((c) => ({ id: String(c.id), rules: JSON.parse(String(c.rules)) as unknown,
+      matchFormat: JSON.parse(String(c.match_format)) as MatchFormat })),
+    entries: entries!.map((e) => ({ id: String(e.id), competitionId: String(e.competition_id), divisionId: String(e.division_id),
+      state: String(e.state), label: String(e.label) })),
+    ledger: ledgerRecords(identity.extraResults[3]!).map((m, i) => ({ ...m, competitionId: String(matches![i]!.competition_id) })),
+  };
+}
+
+/** Everything a season's progress is counted from, in one snapshot: its competitions, their divisions and
+ * entries, and each match's status. Scores are not read; progress counts matches, not results. */
+export async function readSeasonProgress(db: D1Database, hash: string, kind: CredentialKind, seasonId: string) {
+  const identity = await readIdentity(db, hash, kind, null, [
+    db.prepare(`SELECT id, results_deadline_at FROM season
+      WHERE id = ? AND club_id = (SELECT id FROM club WHERE singleton = 1)`).bind(seasonId),
+    db.prepare(`SELECT id, name, discipline, state, visibility, rules, match_format FROM competition
+      WHERE season_id = ? AND club_id = (SELECT id FROM club WHERE singleton = 1) ORDER BY id`).bind(seasonId),
+    db.prepare(`SELECT d.id, d.competition_id, d.ordinal, d.name FROM division d
+      JOIN competition c ON c.id = d.competition_id WHERE c.season_id = ? ORDER BY d.ordinal`).bind(seasonId),
+    // Not playing next season: the entry opted out, a member of it said they are leaving altogether, or a
+    // doubles player told the coach they are not playing, which breaks the pair up.
+    db.prepare(`SELECT e.id, e.competition_id, e.division_id, e.state, e.opted_out_at,
+      (e.opted_out_at IS NOT NULL
+        OR EXISTS (SELECT 1 FROM entry_member em JOIN member m ON m.id = em.member_id
+          WHERE em.entry_id = e.id AND ((m.leaving_at IS NOT NULL AND e.created_at <= m.leaving_at) OR m.status = 'paused'))
+        OR EXISTS (SELECT 1 FROM entry_member em JOIN partner_choice pc ON pc.member_id = em.member_id
+          WHERE em.entry_id = e.id AND pc.competition_id = e.competition_id AND pc.choice = 'leaving')) AS not_playing,
+      -- Who said so: the players leaving, on a break or not playing it, else the player who opted the entry
+      -- out (the latest opt-out, found through the entry's own history); null when the coach did.
+      coalesce((SELECT group_concat(m.display_name, ' and ') FROM entry_member em JOIN member m ON m.id = em.member_id
+          WHERE em.entry_id = e.id AND ((m.leaving_at IS NOT NULL AND e.created_at <= m.leaving_at) OR m.status = 'paused'
+            OR EXISTS (SELECT 1 FROM partner_choice pc WHERE pc.member_id = em.member_id
+              AND pc.competition_id = e.competition_id AND pc.choice = 'leaving'))),
+        CASE WHEN e.opted_out_at IS NOT NULL THEN (SELECT CASE WHEN ev.actor_type = 'member'
+            THEN (SELECT display_name FROM member WHERE id = ev.actor_id) END
+          FROM event ev INDEXED BY event_subject_ix
+          WHERE ev.club_id = e.club_id AND ev.subject_type = 'entry' AND ev.subject_id = e.id
+            AND ev.type = 'entry.opt_out.recorded' ORDER BY ev.id DESC LIMIT 1) END) AS said_by,
+      (SELECT label FROM entry_label WHERE entry_id = e.id) AS label FROM entry e
+      JOIN competition c ON c.id = e.competition_id
+      WHERE c.season_id = ? AND EXISTS (SELECT 1 FROM entry_member em WHERE em.entry_id = e.id)
+      ORDER BY label, e.id`).bind(seasonId),
+    db.prepare(`SELECT m.id, m.competition_id, m.division_id, m.status, m.outcome, m.winning_side, m.retired_side, m.score,
+      s0.entry_id AS side0, s1.entry_id AS side1 FROM match m
+      JOIN competition c ON c.id = m.competition_id
+      LEFT JOIN match_side s0 ON s0.match_id = m.id AND s0.side_index = 0
+      LEFT JOIN match_side s1 ON s1.match_id = m.id AND s1.side_index = 1
+      WHERE c.season_id = ? ORDER BY m.id`).bind(seasonId),
+    db.prepare("SELECT timezone FROM club WHERE singleton = 1"),
+  ]);
+  const [seasons, competitions, divisions, entries, matches, club] = identity.extraResults.map((r) => r.results as Row[]);
+  const season = seasons![0];
+  return {
+    identity,
+    season: season ? { id: String(season.id), deadline: season.results_deadline_at === null ? null : new Date(Number(season.results_deadline_at)) } : null,
+    competitions: competitions!.map((c) => ({ id: String(c.id), name: String(c.name), discipline: String(c.discipline),
+      state: String(c.state), visibility: String(c.visibility), rules: JSON.parse(String(c.rules)) as unknown,
+      matchFormat: JSON.parse(String(c.match_format)) as MatchFormat })),
+    divisions: divisions!.map((d) => ({ id: String(d.id), competitionId: String(d.competition_id), ordinal: Number(d.ordinal), name: String(d.name) })),
+    entries: entries!.map((e) => ({ id: String(e.id), competitionId: String(e.competition_id), divisionId: String(e.division_id),
+      state: String(e.state), optedOut: Boolean(e.not_playing), label: String(e.label),
+      saidBy: e.said_by === null ? null : String(e.said_by) })),
+    // Each match as the ledger holds it, for counting who has played how many.
+    matches: ledgerRecords(identity.extraResults[4]!).map((m, i) => ({ ...m, competitionId: String(matches![i]!.competition_id) })),
+    timezone: String(club![0]!.timezone),
+  };
+}

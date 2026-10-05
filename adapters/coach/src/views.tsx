@@ -1,0 +1,1872 @@
+import { raw } from "hono/html";
+import type { FC, PropsWithChildren } from "hono/jsx";
+import {
+  AGE_GROUPS,
+  ageGroupLabel,
+  CompetitionTables,
+  Credit,
+  deadlineLine,
+  describe,
+  playedOn,
+  STYLE,
+  WeatherBox,
+  type TablesProps,
+  GENDERS,
+  genderLabel,
+  PLAYS,
+  playsLabel,
+  type VenueForecast,
+  type Competition,
+  type Match,
+  type MatchDetail,
+  type Season,
+  type Side,
+} from "@deuceleague/website";
+import { MIRRORED, mirrored } from "./results.js";
+
+/**
+ * The coach's pages: plain server-rendered HTML with no scripts, in the
+ * players' site's style. Hono escapes everything interpolated here.
+ */
+
+export type Tab = "dashboard" | "results" | "tables" | "activity" | "chase" | "members" | "season" | "weather";
+
+export type Frame = { club: string | null; signedIn: boolean; tab: Tab | null };
+
+export type CoachMember = {
+  id: string;
+  display_name: string;
+  email?: string | null;
+  phone?: string | null;
+  invitation_state?: "accepted" | "failed" | null;
+  invitation_at?: string | null;
+  level: number | null;
+  signed_in_at: string | null;
+  /** When they last signed in anywhere, signed out since or not. */
+  last_signed_in_at?: string | null;
+  status: "active" | "paused" | "left";
+  /** When they said they are not playing next season at all, if they did. */
+  leaving_at: string | null;
+  /** What they want to play next season: singles, doubles, both or not now. Null: not said. */
+  wants_to_play?: string | null;
+  /** Personal: present only when this browser's key may read members' details. */
+  gender?: string | null;
+  age_group?: string | null;
+};
+
+/** Someone who asked to join on the club's form, waiting for the coach. */
+export type JoinRequest = {
+  id: string;
+  first_name: string;
+  surname: string;
+  email: string | null;
+  phone: string | null;
+  gender: string | null;
+  age_group: string | null;
+  /** What they want to play, as they chose it on the form. */
+  wants_to_play?: string | null;
+  created_at: string;
+  expires_at: string;
+  /** A member already on the list with the same email address. */
+  member: { id: string; display_name: string } | null;
+};
+
+/** The coach's levels, as the select lists them: the scale runs from 10, a beginner, up to 1. */
+const LEVELS: { level: number; label: string }[] = [
+  { level: 10, label: "10 · Beginner" },
+  { level: 9, label: "9" },
+  { level: 8, label: "8" },
+  { level: 7, label: "7" },
+  { level: 6, label: "6" },
+  { level: 5, label: "5 · Intermediate" },
+  { level: 4, label: "4 · Strong club player" },
+  { level: 3, label: "3" },
+  { level: 2, label: "2" },
+  { level: 1, label: "1 · National player" },
+];
+
+const LevelSelect: FC<{ id: string; value: number | null }> = ({ id, value }) => (
+  <select id={id} name="level">
+    <option value="" selected={value === null}>
+      Not set
+    </option>
+    {LEVELS.map((l) => (
+      <option value={String(l.level)} selected={value === l.level}>
+        {l.label}
+      </option>
+    ))}
+  </select>
+);
+
+/** Gender and age group as two selects, the way the join form asks, so the coach can fill or correct them. */
+const PersonSelects: FC<{ id: string; gender: string | null; ageGroup: string | null }> = ({ id, gender, ageGroup }) => (
+  <>
+    <div class="field">
+      <label for={`gender-${id}`}>Gender</label>
+      <select id={`gender-${id}`} name="gender">
+        <option value="" selected={!gender}>Not recorded</option>
+        {GENDERS.map(([value, label]) => (
+          <option value={value} selected={gender === value}>{label}</option>
+        ))}
+      </select>
+    </div>
+    <div class="field">
+      <label for={`age-${id}`}>Age group</label>
+      <select id={`age-${id}`} name="age_group">
+        <option value="" selected={!ageGroup}>Not recorded</option>
+        {AGE_GROUPS.map(([value, label]) => (
+          <option value={value} selected={ageGroup === value}>{label}</option>
+        ))}
+      </select>
+    </div>
+  </>
+);
+
+/** What someone wants to play next season, as a select: blank is "not said". */
+const PlaysSelect: FC<{ id: string; value: string | null }> = ({ id, value }) => (
+  <div class="field">
+    <label for={id}>Wants to play</label>
+    <select id={id} name="wants_to_play">
+      <option value="" selected={!value}>Not said</option>
+      {PLAYS.map(([v, label]) => <option value={v} selected={value === v}>{label}</option>)}
+    </select>
+  </div>
+);
+
+/** "Sam Kerr": the name the API gives a new member unless the coach chooses another. */
+const playingName = (r: JoinRequest) => {
+  const first = r.first_name.trim(), surname = r.surname.trim();
+  const full = `${first} ${surname}`.trim();
+  // The API's own limit, as its default keeps to: the field would refuse anything longer.
+  if (full.length <= 60) return full;
+  const initial = [...surname][0];
+  return (initial ? `${first} ${initial.toUpperCase()}.` : first).slice(0, 60);
+};
+
+export type CoachCompetition = Competition & {
+  previous_competition_id: string | null;
+  visibility: "members" | "private";
+  category: "open" | "mens" | "womens" | "mixed";
+  sequence_in_season: number;
+};
+
+type Counts = {
+  matches: number;
+  played: number;
+  outstanding: number;
+  reported: number;
+  disputed: number;
+  percent_played: number | null;
+};
+
+export type Progress = Counts & {
+  competition_id: string;
+  results_deadline_at: string | null;
+  days_remaining: number | null;
+  active_entries: number;
+  /** How many matches each entry is expected to play, and how many entries are short of it. */
+  minimum_matches: number;
+  below_minimum: number;
+  divisions: (Counts & {
+    division_id: string;
+    ordinal: number;
+    name: string;
+    active_entries: number;
+    below_minimum: number;
+  })[];
+};
+
+/** A competition's progress as the season's progress gives it. */
+export type SeasonProgress = {
+  competitions: (Progress & {
+    name: string;
+    discipline: Competition["discipline"];
+    state: Competition["state"];
+    opted_out: { entry_id: string; label: string; said_by: string | null }[];
+  })[];
+};
+
+export type SeasonView = {
+  season: Season;
+  competitions: {
+    progress: SeasonProgress["competitions"][number];
+    /** Entries whose players said they are not playing next season. */
+    optedOut: string[];
+    /** Next season's competition, once it has been drafted from this one. */
+    next: CoachCompetition | null;
+  }[];
+};
+
+/** One event from the feed, with who did it and what to, as they are called now. */
+export type FeedEvent = {
+  cursor: string;
+  type: string;
+  subject_type: string;
+  actor_type: "api_key" | "member" | "system";
+  actor_name: string | null;
+  subject_name: string | null;
+  occurred_at: string;
+  payload: Record<string, unknown>;
+  /** The competition and partner the payload names by ID, as they are called now. */
+  competition_name: string | null;
+  partner_name: string | null;
+};
+
+/** A match as a list returns it, with when it last changed. */
+type Listed = Match & { updated_at: string };
+
+export type ChaseRow = {
+  competition_name: string;
+  division_id: string;
+  division_name: string;
+  member_id: string;
+  display_name: string;
+  email?: string | null;
+  phone?: string | null;
+  needs_playing: number;
+  awaiting_you: number;
+  awaiting_them: number;
+  days_remaining: number | null;
+  waiting_on: string[];
+  matches_played: number;
+  minimum_matches: number;
+  matches_short: number;
+};
+
+/** What the coach's pages add to the players' style. */
+const COACH_STYLE = `
+table.progress th, table.progress td { text-align: right; width: auto; white-space: nowrap; }
+table.progress .name { text-align: left; width: 100%; white-space: normal; vertical-align: bottom; }
+table.progress th.group { text-align: center; color: var(--fg); font-weight: 600; padding-bottom: .2rem; }
+table.progress .start { border-left: 1px solid var(--line); padding-left: .6rem; }
+/* Explanations on hover or focus: the pages run no scripts, and a title's tooltip is slow or never shows. */
+[data-tip] { position: relative; cursor: help; text-decoration: underline dotted; text-underline-offset: 3px; }
+[data-tip]:is(:hover, :focus)::after { content: attr(data-tip); position: absolute; top: calc(100% + 4px); left: 0;
+  z-index: 1; width: max-content; max-width: 15rem; white-space: normal; text-align: left; font-size: .8rem;
+  font-weight: 400; line-height: 1.35; color: var(--fg); background: var(--card); border: 1px solid var(--line);
+  border-radius: 8px; padding: .4rem .6rem; box-shadow: 0 4px 12px rgb(0 0 0 / .15); }
+[data-tip]:focus { outline: none; }
+[data-tip]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+table.progress [data-tip]::after { left: auto; right: 0; }
+.narrow { display: none; }
+details.legend { font-size: .85rem; }
+details.legend dl { display: grid; grid-template-columns: max-content 1fr; gap: .3rem .75rem; margin: .5rem 0 0; }
+details.legend dt { font-weight: 600; }
+details.legend dd { margin: 0; color: var(--muted); }
+table.progress tfoot td { font-weight: 600; border-bottom: 0; }
+.card .titleline { margin-bottom: .6rem; }
+.card .titleline h2 { margin: 0; }
+.tag.minimum { margin-left: 0; font-size: .85rem; background: var(--warn-bg); color: var(--warn); }
+/* Eight columns: on a phone the table scrolls rather than the page. The scroll would clip a tooltip, and a tap
+   is no hover, so the explanations are a list under the table instead. */
+@media (max-width: 559px) {
+  .scroll-x { overflow-x: auto; }
+  .narrow { display: block; }
+  [data-tip] { text-decoration: none; cursor: auto; }
+  [data-tip]:is(:hover, :focus)::after { display: none; }
+}
+progress { width: 100%; height: .6rem; accent-color: var(--accent); margin-bottom: .25rem; }
+ul.plain { margin: 0 0 .75rem; padding-left: 1.2rem; }
+.actions { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }
+form.level { display: flex; align-items: center; gap: .5rem; margin-top: .4rem; }
+form.level label { margin: 0; font-weight: 400; font-size: .9rem; }
+form.level select { width: auto; padding: .3rem .5rem; font-size: .9rem; }
+form.approve { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 0 .75rem; margin-top: .6rem; }
+form.approve .field { flex: 1 1 11rem; margin-bottom: .5rem; }
+form.approve button { margin-bottom: .5rem; }
+form.search { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: .5rem 0 1rem; }
+form.search label { margin: 0; }
+form.search input { flex: 1 1 12rem; width: auto; }
+a.button.danger, button.danger { background: transparent; color: var(--down); border: 1px solid var(--down); }
+details.end summary { color: var(--muted); cursor: pointer; }
+.answer p.deadline { margin: .4rem 0 0; }
+.tag.level { background: var(--past-bg); color: var(--past); }
+.after { margin-top: .75rem; }
+form.court { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 0 .75rem; }
+form.court .field { flex: 1 1 12rem; margin-bottom: .5rem; }
+form.court button { margin-bottom: .5rem; }
+.court-foot { display: flex; align-items: center; justify-content: space-between; gap: .75rem; }
+`;
+
+const TABS: { tab: Tab; href: string; label: string }[] = [
+  { tab: "dashboard", href: "/coach", label: "Dashboard" },
+  { tab: "results", href: "/coach/results", label: "Results" },
+  { tab: "tables", href: "/coach/tables", label: "Tables" },
+  { tab: "activity", href: "/coach/activity", label: "Activity" },
+  { tab: "chase", href: "/coach/chase", label: "Chase list" },
+  { tab: "members", href: "/coach/members", label: "Members" },
+  { tab: "season", href: "/coach/season", label: "Season" },
+  { tab: "weather", href: "/coach/weather", label: "Weather" },
+];
+
+/** A moment on the club's clock: "14 Sept 2026, 18:05". */
+function at(timestamp: string, timezone: string): string {
+  return new Date(timestamp).toLocaleString("en-GB", {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: timezone,
+  });
+}
+
+/** Whole days since a moment: "today", "1 day", "5 days". */
+function daysSince(timestamp: number): string {
+  const days = Math.floor((Date.now() - timestamp) / 86_400_000);
+  return days < 1 ? "less than a day" : days === 1 ? "1 day" : `${days} days`;
+}
+
+const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+
+export const Layout: FC<PropsWithChildren<{ title: string; frame: Frame }>> = ({ title, frame, children }) => (
+  <html lang="en">
+    <head>
+      <meta charset="utf-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1" />
+      <meta name="robots" content="noindex" />
+      <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+      <title>{frame.club ? `${title} · ${frame.club} coach` : title}</title>
+      {/* Raw, not escaped: both are constants in the code, never input. */}
+      <style>{raw(STYLE + COACH_STYLE)}</style>
+    </head>
+    <body>
+      <header>
+        <a class="club" href="/coach">
+          {frame.club ? `${frame.club} · Coach` : "DeuceLeague · Coach"}
+        </a>
+      </header>
+      <main>
+        {frame.signedIn && (
+          <nav class="tabs" aria-label="Coach">
+            {TABS.map((t) => (
+              <a href={t.href} aria-current={frame.tab === t.tab ? "page" : undefined}>
+                {t.label}
+              </a>
+            ))}
+          </nav>
+        )}
+        {children}
+      </main>
+      <footer>
+        {frame.signedIn && (
+          <form method="post" action="/coach/sign-out">
+            <button class="link" type="submit">
+              Sign out
+            </button>
+          </form>
+        )}
+        <Credit />
+      </footer>
+    </body>
+  </html>
+);
+
+const Notice: FC<{ message: string | undefined }> = ({ message }) =>
+  message ? (
+    <div class="notice" role="alert">
+      {message}
+    </div>
+  ) : null;
+
+export const SignIn: FC<{ frame: Frame; message?: string }> = ({ frame, message }) => (
+  <Layout title="Coach sign-in" frame={frame}>
+    <h1>Coach sign-in</h1>
+    <Notice message={message} />
+    <p>
+      Paste the administrator key the installer showed you. This browser gets its own key, which lasts 90 days; the
+      administrator key itself is not kept.
+    </p>
+    <form method="post" action="/coach/sign-in">
+      <div class="field">
+        <label for="key">API key</label>
+        <input id="key" name="key" type="password" autocomplete="off" required />
+      </div>
+      <button type="submit">Sign in</button>
+    </form>
+  </Layout>
+);
+
+/** Bringing the club online: shown until nine in ten members have signed in. */
+export type Online = {
+  members: number;
+  signedIn: number;
+  /** Where players sign in, for the announcement. */
+  signInUrl: string;
+  /** Whether players can ask for their own link by email. */
+  byEmail: boolean;
+  /** Members with a telephone but no email who have never signed in; null when this key may not read contacts. */
+  phoneOnly: CoachMember[] | null;
+};
+
+/** A season being prepared, and how many competitions it has drafted. */
+export type Preparing = { name: string; drafts: number };
+
+const OnlinePanel: FC<{ online: Online }> = ({ online }) => (
+  <div class="card">
+    <h2 id="online">Getting your club online</h2>
+    <p>
+      <strong>{online.signedIn} of {online.members}</strong> members have signed in. Post this in the club's group
+      chat or email to everyone:
+    </p>
+    <blockquote>
+      Our league is online. Open {online.signInUrl} on your phone
+      {online.byEmail
+        ? ", enter the email address the club has for you and press \"Email me a sign-in link\". No email, or nothing arrived? Ask the coach for a link."
+        : " and ask the coach for your sign-in link."}{" "}
+      A link works once, within seven days, and you then stay signed in.
+    </blockquote>
+    {online.phoneOnly && online.phoneOnly.length > 0 && (
+      <>
+        <h3>Telephone only, not signed in ({online.phoneOnly.length})</h3>
+        <p class="muted">They cannot ask for a link by email. Make each a link and send it on WhatsApp or by text.</p>
+        <ul class="list">
+          {online.phoneOnly.map((m) => (
+            <li class="answer">
+              <div class="answer-row">
+                <span>{m.display_name}<span class="muted"> · {m.phone}</span></span>
+                <form method="post" action={`/coach/members/${m.id}/sign-in-link`}>
+                  <button class="quiet small" type="submit">Sign-in link</button>
+                </form>
+              </div>
+            </li>
+          ))}
+        </ul>
+      </>
+    )}
+  </div>
+);
+
+export const Dashboard: FC<{
+  frame: Frame;
+  seasons: SeasonView[];
+  /** How many people are asking to join, and whether that is only the first page of them. */
+  asking: number;
+  askingMore: boolean;
+  timezone: string;
+  /** Null once most of the club has signed in. */
+  online?: Online | null;
+  preparing?: Preparing[];
+}> = ({ frame, seasons, asking, askingMore, timezone, online = null, preparing = [] }) => (
+  <Layout title="Dashboard" frame={frame}>
+    {asking > 0 && (
+      <div class="notice">
+        <a href="/coach/members">
+          {askingMore ? `More than ${asking} people are` : asking === 1 ? "1 person is" : `${asking} people are`} asking to join
+          the league
+        </a>
+      </div>
+    )}
+    {seasons.length === 0 && (
+      <>
+        <h1>No season is running</h1>
+        {preparing.length === 0 && (
+          <p>
+            Once a season and its competitions are active, this page shows how far through they are. Prepare the next
+            season from the last one on the <a href="/coach/season">Season</a> tab.
+          </p>
+        )}
+      </>
+    )}
+    {preparing.map((p) => (
+      <div class="notice">
+        <a href="/coach/season">
+          {p.drafts > 0
+            ? `${p.name} is drafted: ${plural(p.drafts, "competition")}. Review and start it on the Season tab.`
+            : `${p.name} is being prepared, with no competitions yet. Carry on with it on the Season tab.`}
+        </a>
+      </div>
+    ))}
+    {online && <OnlinePanel online={online} />}
+    {seasons.map(({ season, competitions }) => {
+      const disputed = competitions.reduce((n, x) => n + x.progress.disputed, 0);
+      const reported = competitions.reduce((n, x) => n + x.progress.reported, 0);
+      const deadline = deadlineLine(season.results_deadline_at, timezone);
+      return (
+        <>
+          <div class="titleline">
+            <h1>{season.name}</h1>
+            {deadline && <span class="deadline">{deadline}</span>}
+          </div>
+          {(disputed > 0 || reported > 0) && (
+            <div class="notice">
+              <a href="/coach/results">
+                {[
+                  disputed > 0 && `${plural(disputed, "result")} disputed`,
+                  reported > 0 && `${plural(reported, "result")} waiting on the other side`,
+                ]
+                  .filter(Boolean)
+                  .join(", ")}
+              </a>
+            </div>
+          )}
+          {competitions.length === 0 && <p class="muted">No competition in this season is active yet.</p>}
+          {competitions.map(({ progress, optedOut, next }) => {
+            const entries = progress.discipline === "doubles" ? "Pairs" : "Players";
+            const columns = columnsOf(progress, entries);
+            return (
+              <div class="card" id={`competition-${progress.competition_id}`}>
+                <div class="titleline">
+                  <h2>{progress.name}</h2>
+                  <Minimum progress={progress} />
+                </div>
+                <progress value={progress.played} max={Math.max(progress.matches, 1)} />
+                <p>
+                  {progress.played} of {plural(progress.matches, "match", "matches")} played
+                  {progress.percent_played !== null && ` (${Math.round(progress.percent_played)}%)`}
+                </p>
+                <div class="scroll-x">
+                  <table class="progress">
+                    <thead>
+                      <tr>
+                        <th scope="col" rowspan={2} class="name">
+                          Division
+                        </th>
+                        <th scope="colgroup" colspan={4} class="group start">
+                          Matches
+                        </th>
+                        <th scope="colgroup" colspan={3} class="group start">
+                          {entries}
+                        </th>
+                      </tr>
+                      <tr>
+                        {columns.map((c) => (
+                          <th scope="col" class={c.start ? "start" : undefined} tabindex={0} data-tip={c.tip}>
+                            {c.label}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {progress.divisions.map((d) => (
+                        <ProgressRow name={d.name} counts={d} />
+                      ))}
+                    </tbody>
+                    {progress.divisions.length > 1 && (
+                      <tfoot>
+                        <ProgressRow name="All divisions" counts={progress} />
+                      </tfoot>
+                    )}
+                  </table>
+                </div>
+                <details class="legend narrow after">
+                  <summary>What the columns mean</summary>
+                  <dl>
+                    {progress.minimum_matches > 0 && (
+                      <>
+                        <dt>Minimum</dt>
+                        <dd>{MINIMUM_TIP}</dd>
+                      </>
+                    )}
+                    {columns.map((c) => (
+                      <>
+                        <dt>{c.term}</dt>
+                        <dd>{c.tip}</dd>
+                      </>
+                    ))}
+                  </dl>
+                </details>
+                <p class="muted after">
+                  {optedOut.length === 0 ? (
+                    "Nobody has opted out of next season yet."
+                  ) : (
+                    <>
+                      <strong>{optedOut.length}</strong> opted out of next season: {optedOut.join(", ")}.
+                    </>
+                  )}{" "}
+                  {next ? `Next season's ${next.name} is drafted (${next.state}).` : "Next season is not drafted yet."}
+                  {progress.discipline === "doubles" && (
+                    <>
+                      {" "}
+                      <a href={`/coach/pairs#competition-${progress.competition_id}`}>Next season's pairs</a>
+                    </>
+                  )}
+                </p>
+              </div>
+            );
+          })}
+        </>
+      );
+    })}
+  </Layout>
+);
+
+/** The dashboard table's second header row: each column, its name out of the table, and what it counts. */
+function columnsOf(progress: Progress, entries: "Players" | "Pairs") {
+  const those = entries.toLowerCase();
+  return [
+    { label: "Played", term: "Played", tip: "Matches with a confirmed result", start: true },
+    { label: "Total", term: "Total matches", tip: "Every fixture in the division" },
+    { label: "Waiting", term: "Waiting", tip: "Reported by one side, waiting on the other to confirm" },
+    { label: "Disputed", term: "Disputed", tip: "The two sides reported different results" },
+    { label: "Total", term: `Total ${those}`, tip: `${entries} still in the competition`, start: true },
+    {
+      label: "Short",
+      term: "Short",
+      tip:
+        progress.minimum_matches === 0
+          ? "No minimum is set"
+          : `Played fewer than the ${progress.minimum_matches}-match minimum, or than all their fixtures if they have fewer`,
+    },
+    { label: "% short", term: "% short", tip: `The share of ${those} short of the minimum` },
+  ];
+}
+
+const MINIMUM_TIP = "Anyone short of it once the tables are final is left out of next season's draft";
+
+/**
+ * The competition's minimum, beside its name: each entry is expected to play it,
+ * or all their fixtures if a division gives them fewer.
+ */
+const Minimum: FC<{ progress: Progress }> = ({ progress }) =>
+  progress.minimum_matches === 0 ? (
+    <span class="muted">No minimum</span>
+  ) : (
+    <span class="tag minimum" tabindex={0} data-tip={MINIMUM_TIP}>
+      Minimum {plural(progress.minimum_matches, "match", "matches")} each
+    </span>
+  );
+
+/** A division's row in the dashboard's table, or the competition's total under it. */
+const ProgressRow: FC<{
+  name: string;
+  counts: Counts & { active_entries: number; below_minimum: number };
+}> = ({ name, counts }) => (
+  <tr>
+    <td class="name">{name}</td>
+    <td class="start">{counts.played}</td>
+    <td>{counts.matches}</td>
+    <td>{counts.reported || "–"}</td>
+    <td>{counts.disputed || "–"}</td>
+    <td class="start">{counts.active_entries}</td>
+    <td>{counts.below_minimum || "–"}</td>
+    <td>{counts.active_entries ? `${Math.round((100 * counts.below_minimum) / counts.active_entries)}%` : "–"}</td>
+  </tr>
+);
+
+/** The claim each side stands by now: its newest one still pending. */
+function standing(match: MatchDetail, side: Side) {
+  return match.claims.findLast((x) => x.side === side && x.state === "pending");
+}
+
+/** An entry not playing next season, with who said so when that is not the whole entry: "Tom F. / Dan O. (Tom F. said so)". */
+export const notPlaying = (e: { label: string; said_by: string | null }) =>
+  e.said_by && e.said_by !== e.label ? `${e.label} (${e.said_by} said so)` : e.label;
+
+/** Where a match is played: "Men's singles · Division 2". */
+const where = (m: Match) => [m.competition_name, m.division_name].filter(Boolean).join(" · ");
+
+const namesOf = (m: Match): [string, string] => [m.sides[0]?.label ?? "Side 1", m.sides[1]?.label ?? "Side 2"];
+
+/** A member's disputes, as the API counts them. */
+type DisputeCounts = { disputes: number; gave_way: number; held: number; settled_by_coach: number; unresolved: number };
+export type DisputeRow = { member_id: string; display_name: string; this_season: DisputeCounts; earlier: DisputeCounts };
+
+/** The disputes of a member who has been in at least this many are shown to the coach. */
+const REPEAT = 2;
+
+export const Results: FC<{
+  frame: Frame;
+  disputed: MatchDetail[];
+  reported: MatchDetail[];
+  /** How many there are of each, including those not read in full. */
+  counts: { disputed: number; reported: number };
+  /** Those not read in full: disputes first, then the reports waiting longest. */
+  more: (Match & { updated_at: string })[];
+  late: Match[];
+  history: DisputeRow[];
+  timezone: string;
+}> = ({ frame, disputed, reported, counts, more, late, history, timezone }) => (
+  <Layout title="Results" frame={frame}>
+    <h1>Results to sort out</h1>
+    <p class="muted">
+      Results still waiting for matching entries, in the season under way. Each side enters independently on the
+      match page. If entries differ, ask the players to speak outside the app and enter the agreed result.
+      Open a match to inspect its history and make a coach decision if it stays unresolved.
+      Correcting a confirmed result asks for an explicit override.
+    </p>
+    <p><a href="/coach/matches">Find a match or correct a confirmed result</a> · <a href="/coach/matches?status=open">Matches with no entries yet</a></p>
+
+    <h2>Disputed ({counts.disputed})</h2>
+    {counts.disputed === 0 && <p class="muted">No disputes.</p>}
+    {disputed.map((m) => {
+      const names = namesOf(m);
+      const claims = ([0, 1] as const).map((side) => standing(m, side));
+      const latest = Math.max(...m.claims.map((x) => Date.parse(x.submitted_at)));
+      return (
+        <div class="card">
+          <h2>
+            <a href={`/coach/matches/${m.id}`}>{names[0]} v {names[1]}</a>
+          </h2>
+          <p class="muted">{where(m)}</p>
+          <div class="claims">
+            {claims.map((claim, side) => (
+              <div>
+                <div class="who">{names[side]} says</div>
+                <div class="what">{claim ? describe(claim, 0, names) : "Nothing yet"}</div>
+                {claim && <div class="muted">{at(claim.submitted_at, timezone)}</div>}
+              </div>
+            ))}
+          </div>
+          <p class="muted">Both written with {names[0]}'s games first.</p>
+          {mirrored(claims[0], claims[1]) && <p>{MIRRORED}</p>}
+          {m.differences.length > 0 && (
+            <ul class="plain">
+              {m.differences.map((d) => (
+                <li>{d.replace(/\bside ([01])\b/g, (_, i: string) => names[Number(i)]!)}</li>
+              ))}
+            </ul>
+          )}
+          <p class="muted">Disputed since {at(new Date(latest).toISOString(), timezone)}.</p>
+        </div>
+      );
+    })}
+
+    <h2>Waiting on the other side ({counts.reported})</h2>
+    {counts.reported === 0 ? (
+      <p class="muted">Nothing waiting.</p>
+    ) : reported.length === 0 ? (
+      <p class="muted">Listed below.</p>
+    ) : (
+      <div class="card">
+        <ul class="list">
+          {reported.map((m) => {
+            const names = namesOf(m);
+            const waiting = m.waiting_on ?? 1;
+            const claim = standing(m, (1 - waiting) as Side);
+            return (
+              <li class="answer">
+                <strong>
+                  <a href={`/coach/matches/${m.id}`}>{names[0]} v {names[1]}</a>
+                </strong>{" "}
+                <span class="muted">· {where(m)}</span>
+                <br />
+                {claim ? (
+                  <span>
+                    {names[claim.side ?? 0]} entered: {describe(claim, 0, names)}.{" "}
+                    <span class="deadline">
+                      {names[waiting]} has not answered in {daysSince(Date.parse(claim.submitted_at))}.
+                    </span>
+                    <br />
+                    <span class="muted">Written with {names[0]}'s games first.</span>
+                  </span>
+                ) : (
+                  <span>Waiting on {names[waiting]}.</span>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      </div>
+    )}
+
+    {more.length > 0 && (
+      <>
+        <h2>And {more.length} more</h2>
+        <p class="muted">Too many to show in full on one page. Those at the top have waited longest.</p>
+        <div class="card">
+          <ul class="list">
+            {more.map((m) => {
+              const names = namesOf(m);
+              return (
+                <li class="answer">
+                  <a href={`/coach/matches/${m.id}`}>{names[0]} v {names[1]}</a> <span class="muted">· {where(m)}</span>
+                  <br />
+                  <span class="muted">
+                    {m.status === "disputed" ? "Disputed" : "Waiting on the other side"} since{" "}
+                    {at(m.updated_at, timezone)}
+                  </span>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      </>
+    )}
+
+    {late.length > 0 && (
+      <>
+        <h2>Not played by the deadline ({late.length})</h2>
+        <p class="muted">Reporting has closed, so these stay unplayed unless you settle them.</p>
+        <div class="card">
+          <ul class="list">
+            {late.map((m) => {
+              const names = namesOf(m);
+              return (
+                <li class="answer">
+                  <a href={`/coach/matches/${m.id}`}>{names[0]} v {names[1]}</a> <span class="muted">· {where(m)}</span>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      </>
+    )}
+
+    <h2>Players in repeated disputes</h2>
+    {history.filter((r) => r.this_season.disputes + r.earlier.disputes >= REPEAT).length === 0 ? (
+      <p class="muted">
+        {history.length === 0
+          ? "Nobody has been in a dispute."
+          : `Nobody has been in more than ${REPEAT - 1} dispute across the seasons.`}
+      </p>
+    ) : (
+      <>
+        <p class="muted">
+          Players in {REPEAT} or more disputes, this season and earlier. Both players are in every dispute, so look at
+          how each ended: someone who keeps giving way, or whose score others keep accepting, is not the same as
+          someone caught up in another player's. Only you see this.
+        </p>
+        <div class="card">
+          <ul class="list">
+            {history
+              .filter((r) => r.this_season.disputes + r.earlier.disputes >= REPEAT)
+              .map((r) => {
+                const total = (key: keyof DisputeCounts) => r.this_season[key] + r.earlier[key];
+                return (
+                  <li class="answer">
+                    <strong>{r.display_name}</strong>{" "}
+                    <span class="muted">
+                      · {plural(total("disputes"), "dispute")}: {r.this_season.disputes} this season,{" "}
+                      {r.earlier.disputes} earlier
+                    </span>
+                    <br />
+                    <span class="muted">
+                      {[
+                        total("gave_way") > 0 && `gave way in ${total("gave_way")}`,
+                        total("held") > 0 && `the other gave way in ${total("held")}`,
+                        total("settled_by_coach") > 0 && `settled by you in ${total("settled_by_coach")}`,
+                        total("unresolved") > 0 && `${total("unresolved")} still open`,
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}
+                    </span>
+                  </li>
+                );
+              })}
+          </ul>
+        </div>
+      </>
+    )}
+  </Layout>
+);
+
+/** A result in one line, the winner first: "Sam beat Alex 6-4, 6-3". */
+function resultLine(m: Match): string {
+  const names = namesOf(m);
+  const r = m.result;
+  if (!r || r.winning_side === null) return `${names[0]} v ${names[1]}: not played`;
+  const winner = r.winning_side;
+  const how = describe(r, winner, names);
+  return `${names[winner]} beat ${names[(1 - winner) as Side]}${r.outcome === "completed" ? " " : ": "}${how}`;
+}
+
+const NOUNS: Record<string, string> = {
+  season: "the season",
+  competition: "",
+  division: "",
+  entry: "the entry",
+  court_location: "the court",
+  api_key: "the key",
+};
+
+/** An event as a sentence: who did what, to what. */
+export function sentence(e: FeedEvent): string {
+  const actor =
+    e.actor_name ?? { api_key: "A key", member: "A player", system: "DeuceLeague" }[e.actor_type] ?? "Someone";
+  const subject = e.subject_name ?? "someone";
+  const [kind, ...rest] = e.type.split(".");
+  const action = rest.join(".");
+  // Only a change of state is a move; an invitation's state, say, is one word.
+  const raw = e.payload.state as { from?: unknown; to?: unknown } | string | undefined;
+  const state = raw && typeof raw === "object" && typeof raw.from === "string" && typeof raw.to === "string"
+    ? { from: raw.from, to: raw.to } : undefined;
+  // Next season's choices are made per competition, so each line says which.
+  const competition = e.competition_name ?? "their competition";
+  const doubles = e.competition_name ?? "doubles";
+  const partner = e.partner_name ?? "someone";
+  // A player opting out themselves, or the coach or a partner doing it for them.
+  const opted = (how: string) =>
+    e.actor_name === e.subject_name ? `${subject} opted ${how}` : `${actor} opted ${subject} ${how}`;
+  switch (e.type) {
+    case "match.claim.reported":
+      return `${actor} reported a score for ${subject}`;
+    case "match.claim.accepted":
+      return `${actor} agreed the score for ${subject}`;
+    case "match.disputed":
+      return `The two sides of ${subject} disagree on the score`;
+    case "match.result.confirmed":
+      return e.payload.how === "settled" ? `${actor} settled ${subject}` : `The result of ${subject} is agreed`;
+    case "member.login_link.created":
+      return `${actor} made a sign-in link for ${subject}`;
+    case "member.invitation.recorded":
+      return raw === "failed" ? `${actor} could not email a sign-in link to ${subject}`
+        : `${actor} emailed a sign-in link to ${subject}`;
+    case "member.signed_in":
+      return `${subject} signed in`;
+    case "member.signed_out":
+      return `${subject} signed out`;
+    case "member.signed_out_everywhere":
+      return `${actor} signed ${subject} out everywhere`;
+    case "member.created":
+      return e.payload.join_request_id ? `${actor} approved ${subject}'s request to join` : `${actor} added ${subject}`;
+    case "member.leaving.recorded":
+      return `${subject} is not playing next season`;
+    case "member.leaving.cleared":
+      return `${subject} is playing next season again`;
+    case "member.paused":
+      return `${subject} is taking a break`;
+    case "member.resumed":
+      return `${subject} is back from a break`;
+    case "join_request.received":
+      return "Someone asked to join the league";
+    case "join_request.declined":
+      return `${actor} declined a request to join`;
+    case "member.updated":
+      return `${actor} changed ${subject}'s details`;
+    case "member.removed":
+      return `${actor} removed ${subject}`;
+    case "member.erased":
+      return `${actor} erased a member's personal data`;
+    case "api_key.revoked":
+      return `${actor} revoked the key ${subject}`;
+    case "api_key.recovered":
+      return `A new administrator key, ${subject}, was made with the recovery tool`;
+    case "entry.opt_out.recorded":
+      return opted(`out of ${competition} next season`);
+    case "entry.opt_out.cleared":
+      return opted(`back in to ${competition} next season`);
+    case "partner_choice.recorded":
+      if (e.payload.choice === "leaving") return `${subject} is not playing ${doubles} next season`;
+      if (e.payload.agreed) return `${subject} agreed to play ${doubles} with ${partner} next season`;
+      return e.payload.partner_id
+        ? `${subject} asked ${partner} to play ${doubles} with them next season`
+        : `${subject} is looking for a new partner in ${doubles} next season`;
+    case "partner_choice.cleared":
+      return `${subject} is keeping their partner in ${doubles} next season`;
+    case "partner_choice.declined":
+      return `${actor} said no to playing ${doubles} with ${subject} next season`;
+    case "division.fixtures_generated":
+      return `${actor} drew up the fixtures for ${subject}`;
+    case "competition.placements_filled":
+      return `${actor} filled ${subject} from last season's tables`;
+    case "club.created":
+      return "The club was set up";
+    case "club.updated":
+      return `${actor} changed the club's settings`;
+    case "installation.sample.created":
+      return "The sample league was added";
+    case "weather.updated":
+      return `${actor} changed the forecast settings`;
+  }
+  const noun = [NOUNS[kind!] ?? kind!.replace(/_/g, " "), subject].filter(Boolean).join(" ");
+  if (state) return `${actor} moved ${noun} from ${state.from} to ${state.to}`;
+  const verb = { created: "added", updated: "changed", deleted: "deleted" }[action];
+  return verb ? `${actor} ${verb} ${noun}` : `${actor}: ${e.type}`;
+}
+
+const ResultList: FC<{ results: Listed[]; timezone: string }> = ({ results, timezone }) => (
+  <div class="card">
+    <ul class="list">
+      {results.map((m) => (
+        <li class="answer">
+          <a href={`/coach/matches/${m.id}`}>{resultLine(m)}</a>
+          <br />
+          <span class="muted">
+            {where(m)} · {m.result?.played_on ? `played ${playedOn(m.result.played_on)}` : `recorded ${at(m.updated_at, timezone)}`}
+          </span>
+        </li>
+      ))}
+    </ul>
+  </div>
+);
+
+const EventList: FC<{ events: FeedEvent[]; timezone: string }> = ({ events, timezone }) => (
+  <div class="card">
+    <ul class="list">
+      {events.map((e) => (
+        <li class="answer">
+          {sentence(e)}
+          <br />
+          <span class="muted">{at(e.occurred_at, timezone)}</span>
+        </li>
+      ))}
+    </ul>
+  </div>
+);
+
+export const Activity: FC<{
+  frame: Frame;
+  results: Listed[];
+  moreResults: boolean;
+  events: FeedEvent[];
+  moreEvents: boolean;
+  timezone: string;
+}> = ({ frame, results, moreResults, events, moreEvents, timezone }) => (
+  <Layout title="Activity" frame={frame}>
+    <h1>Activity</h1>
+    <h2>Latest results</h2>
+    {results.length === 0 ? (
+      <p class="muted">No results yet.</p>
+    ) : (
+      <ResultList results={results} timezone={timezone} />
+    )}
+    {moreResults && (
+      <p>
+        <a href="/coach/activity/results">See more results</a>
+      </p>
+    )}
+    <h2>Everything that happened</h2>
+    <p class="muted">Scores, sign-ins and changes, by players, by you and by any API key, such as your coding agent's.</p>
+    {events.length === 0 ? <p class="muted">Nothing yet.</p> : <EventList events={events} timezone={timezone} />}
+    {moreEvents && (
+      <p>
+        <a href="/coach/activity/all">See more activity</a>
+      </p>
+    )}
+  </Layout>
+);
+
+/** Links between pages of 50: back to the newest, and on to the next. */
+const Pager: FC<{ path: string; from: string | undefined; next: string | null }> = ({ path, from, next }) => (
+  <p class="jump">
+    {from && <a href={path}>Back to the newest</a>}
+    {next && <a href={`${path}?after=${encodeURIComponent(next)}`}>Show the next 50</a>}
+    <a href="/coach/activity">Back to activity</a>
+  </p>
+);
+
+export const LatestResults: FC<{
+  frame: Frame;
+  results: Listed[];
+  from: string | undefined;
+  next: string | null;
+  timezone: string;
+}> = ({ frame, results, from, next, timezone }) => (
+  <Layout title="Latest results" frame={frame}>
+    <h1>Latest results</h1>
+    <p class="muted">Newest first, 50 at a time.</p>
+    {results.length === 0 ? (
+      <p class="muted">No more results.</p>
+    ) : (
+      <ResultList results={results} timezone={timezone} />
+    )}
+    <Pager path="/coach/activity/results" from={from} next={next} />
+  </Layout>
+);
+
+export const LatestEvents: FC<{
+  frame: Frame;
+  events: FeedEvent[];
+  from: string | undefined;
+  next: string | null;
+  timezone: string;
+}> = ({ frame, events, from, next, timezone }) => (
+  <Layout title="Everything that happened" frame={frame}>
+    <h1>Everything that happened</h1>
+    <p class="muted">Newest first, 50 at a time.</p>
+    {events.length === 0 ? <p class="muted">Nothing more.</p> : <EventList events={events} timezone={timezone} />}
+    <Pager path="/coach/activity/all" from={from} next={next} />
+  </Layout>
+);
+
+/** The tables and the forecast as players see them, for the coach to know what they're looking at. */
+export const Tables: FC<{ frame: Frame; tables: TablesProps }> = ({ frame, tables }) => (
+  <Layout title={tables.past ? `${tables.competition.name}, ${tables.past}` : tables.competition.name} frame={frame}>
+    <p class="muted">What players see: the tables of the competitions open to members.</p>
+    <CompetitionTables {...tables} />
+  </Layout>
+);
+
+/**
+ * "9 of 15 players (60%) are short of the 4-match minimum", or that none is. The
+ * minimum is the rule, or all a player's fixtures if fewer, as the API counts it.
+ */
+const ShortOfMinimum: FC<{ progress: SeasonProgress["competitions"][number] }> = ({ progress }) => {
+  const { below_minimum: short, active_entries: all, minimum_matches: minimum } = progress;
+  if (minimum === 0 || all === 0) return null;
+  const who = progress.discipline === "doubles" ? ["pair", "pairs"] : ["player", "players"];
+  return short === 0 ? (
+    <p class="muted">Nobody is short of the {minimum}-match minimum.</p>
+  ) : (
+    <p>
+      <span class="deadline">
+        {short} of {plural(all, who[0]!, who[1])} ({Math.round((100 * short) / all)}%)
+      </span>{" "}
+      {short === 1 ? "is" : "are"} short of the {minimum}-match minimum
+      {progress.divisions.length > 1 && (
+        <span class="muted">
+          {" "}
+          ·{" "}
+          {progress.divisions
+            .filter((d) => d.below_minimum > 0)
+            .map((d) => `${d.name}: ${d.below_minimum} of ${d.active_entries}`)
+            .join(", ")}
+        </span>
+      )}
+    </p>
+  );
+};
+
+export const Chase: FC<{
+  frame: Frame;
+  rows: ChaseRow[];
+  within: number | null;
+  choices: number[];
+  /** The competitions under way, for who is short of their minimum. */
+  progress: SeasonProgress["competitions"];
+  /** Whether the coach's key may read members' email addresses and telephone numbers. */
+  contacts: boolean;
+}> = ({ frame, rows, within, choices, progress, contacts }) => {
+  const groups = new Map<string, ChaseRow[]>();
+  for (const row of rows) {
+    const key = `${row.competition_name} · ${row.division_name}`;
+    groups.set(key, [...(groups.get(key) ?? []), row]);
+  }
+  const ordered = [...groups].sort(([a], [b]) => a.localeCompare(b, "en", { numeric: true }));
+  const emails = [...new Set(rows.flatMap((r) => (r.email ? [r.email] : [])))];
+  return (
+    <Layout title="Chase list" frame={frame}>
+      <h1>Chase list</h1>
+      <p>
+        Who still has matches to play or scores to confirm. Remind them however you talk to players: this site sends
+        nothing.
+      </p>
+      {!contacts && <p class="muted">Email addresses and telephone numbers need a key with the members:pii permission.</p>}
+      <nav class="tabs" aria-label="Which competitions">
+        <a href="/coach/chase" aria-current={within === null ? "page" : undefined}>
+          All
+        </a>
+        {choices.map((days) => (
+          <a href={`/coach/chase?within_days=${days}`} aria-current={within === days ? "page" : undefined}>
+            Deadline within {days} days
+          </a>
+        ))}
+      </nav>
+      {progress.length > 0 && (
+        <div class="card">
+          <h2>Short of the minimum</h2>
+          <p class="muted">
+            Anyone still short when the season ends is left out of next season's draft; you can add them back.
+            Anyone with fewer fixtures than the minimum is expected to play them all.
+          </p>
+          <ul class="list">
+            {progress.map((x) => (
+              <li class="answer">
+                <strong>{x.name}</strong>
+                <ShortOfMinimum progress={x} />
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {emails.length > 0 && (
+        <p>
+          <a class="button quiet small" href={`mailto:?bcc=${emails.map(encodeURIComponent).join(",")}`}>
+            Email {plural(emails.length, "player")} with an address (BCC)
+          </a>
+        </p>
+      )}
+      {rows.length === 0 && (
+        <p class="muted">
+          {within === null
+            ? "Nobody has anything outstanding."
+            : `Nobody has anything outstanding in a competition whose deadline is within ${within} days.`}
+        </p>
+      )}
+      {ordered.map(([group, members]) => {
+        const days = members[0]!.days_remaining;
+        return (
+          <>
+            <h2>
+              {group}
+              {days !== null && <span class="muted"> · {plural(days, "day")} left</span>}
+            </h2>
+            <div class="card">
+              <ul class="list">
+                {members.map((r) => (
+                  <li class="answer">
+                    <strong>{r.display_name}</strong>
+                    {r.email && <span class="muted"> · {r.email}</span>}
+                    {r.phone && <span class="muted"> · <a href={`tel:${r.phone.replace(/[^\d+]/g, "")}`}>{r.phone}</a></span>}
+                    <br />
+                    {[
+                      r.needs_playing > 0 && `${plural(r.needs_playing, "match", "matches")} to play`,
+                      r.awaiting_you > 0 && `${plural(r.awaiting_you, "score")} to confirm`,
+                      r.awaiting_them > 0 && `${plural(r.awaiting_them, "score")} waiting on the opponent`,
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")}
+                    {r.matches_short > 0 && (
+                      <>
+                        <br />
+                        <span class="deadline">
+                          Played {r.matches_played} of {r.minimum_matches}: {r.matches_short} short
+                        </span>
+                      </>
+                    )}
+                    {r.waiting_on.length > 0 && (
+                      <>
+                        <br />
+                        <span class="muted">Against {r.waiting_on.join(", ")}</span>
+                      </>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </>
+        );
+      })}
+    </Layout>
+  );
+};
+
+/** How long every sign-in link works, emailed or handed over: a member may not open it for days. */
+export const LINK_MINUTES = 7 * 24 * 60;
+
+/** An emailed sign-in link that ran out before the member signed in with it. */
+const unusedLink = (m: CoachMember, now = Date.now()) => m.invitation_state === "accepted" && !!m.invitation_at
+  && Date.parse(m.invitation_at) + LINK_MINUTES * 60_000 < now
+  && !signedInSince(m, m.invitation_at);
+
+/** Whether they have signed in at all, or since a moment: signing out since does not undo it. */
+export const signedInSince = (m: CoachMember, since: string | null = null) => {
+  const last = m.last_signed_in_at ?? m.signed_in_at;
+  return !!last && (since === null || Date.parse(last) >= Date.parse(since));
+};
+
+export const Members: FC<{
+  frame: Frame;
+  members: CoachMember[];
+  /** Members who have left the club: their results stay, and they are not placed again. */
+  left: CoachMember[];
+  /** Active members in no competition under way or being drafted, to be placed in the next draft. Null when not worked out. */
+  waiting: CoachMember[] | null;
+  /** Null when this browser's key may not read their details. */
+  requests: JoinRequest[] | null;
+  /** More are waiting behind these. */
+  moreRequests: boolean;
+  /** What the last approval or decline did. */
+  done: string | null;
+  addedId: string | null;
+  emailConfigured: boolean;
+  timezone: string;
+  /** Showing only those placed in a competition who have never signed in. */
+  unsigned?: boolean;
+  /** What the coach searched for, or "" for everyone. */
+  query?: string;
+  /** Everyone on the list, and how many of them have signed in, whatever the search shows. */
+  total: number;
+  signedIn: number;
+}> = ({ frame, members, left, waiting, requests, moreRequests, done, addedId, timezone, emailConfigured, unsigned = false,
+  query = "", total, signedIn }) => (
+  <Layout title="Members" frame={frame}>
+    <h1>Members</h1>
+    {left.length > 0 && (
+      <p class="jump">
+        <a href="#former">Former members ({left.length})</a>
+      </p>
+    )}
+    {done && (
+      <div class="notice ok" role="status">
+        {done}
+        {addedId && (
+          <>
+            {" "}
+            They will be placed in a division at the start of next season, from the draft on the{" "}
+            <a href="/coach/season">Season</a> tab; a running season is not changed. Make them a sign-in link, or
+            email them an invitation, from <a href={`/coach/members/${addedId}`}>their page</a>.
+          </>
+        )}
+      </div>
+    )}
+    {requests && requests.length > 0 && (
+      <>
+        <h2>Asking to join</h2>
+        <p class="muted">
+          From the form at <a href="/join">/join</a>. Approve someone to add them to the club's list, or decline to
+          delete what they sent. Approving does not put them in a running season: they are placed at the start of next
+          season. A request nobody decides is deleted after 30 days.
+        </p>
+        <div class="card">
+          <ul class="list">
+            {requests.map((r) => (
+              <li class="answer">
+                <strong>
+                  {r.first_name} {r.surname}
+                </strong>
+                <br />
+                <span class="muted">{[r.email, r.phone].filter(Boolean).join(" · ")}</span>
+                <br />
+                <span class="muted">
+                  {[genderLabel(r.gender), ageGroupLabel(r.age_group)].filter(Boolean).join(" · ") ||
+                    "No gender or age group given"}
+                </span>
+                <br />
+                <span class="muted">
+                  Asked {at(r.created_at, timezone)} · deleted {at(r.expires_at, timezone)} if not decided
+                </span>
+                {r.member && (
+                  <p class="deadline">Already a member as {r.member.display_name}, with the same email address.</p>
+                )}
+                <form class="approve" method="post" action={`/coach/join-requests/${r.id}/approve`}>
+                  <div class="field">
+                    <label for={`name-${r.id}`}>Name they play under</label>
+                    <input id={`name-${r.id}`} name="display_name" maxlength={60} value={playingName(r)} required />
+                  </div>
+                  <div class="field">
+                    <label for={`level-${r.id}`}>Level</label>
+                    <LevelSelect id={`level-${r.id}`} value={null} />
+                  </div>
+                  <PersonSelects id={r.id} gender={r.gender} ageGroup={r.age_group} />
+                  <PlaysSelect id={`plays-${r.id}`} value={r.wants_to_play ?? null} />
+                  <button class="small" type="submit">
+                    Approve
+                  </button>
+                  {emailConfigured && <button class="small" type="submit" name="invite" value="yes">Approve and email sign-in link</button>}
+                </form>
+                <form method="post" action={`/coach/join-requests/${r.id}/decline`}>
+                  <button class="quiet small" type="submit">
+                    Decline
+                  </button>
+                </form>
+              </li>
+            ))}
+          </ul>
+        </div>
+        {moreRequests && (
+          <p class="muted">More are waiting. These are the oldest {requests.length}: decide them to see the next.</p>
+        )}
+      </>
+    )}
+    {members.some((m) => m.email !== undefined && (!m.email || !m.phone)) && <div class="notice">
+      <h2>Contact details to complete</h2>
+      <p>Existing members stay on the list. Add their missing email for sign-in links and telephone for WhatsApp league communications.</p>
+      <ul>{members.filter((m) => m.email !== undefined && (!m.email || !m.phone)).map((m) => <li>
+        <a href={`/coach/members/${m.id}`}>{m.display_name}</a>: {[!m.email ? "email" : "", !m.phone ? "telephone" : ""].filter(Boolean).join(" and ")} missing
+      </li>)}</ul>
+    </div>}
+    {waiting && waiting.some((m) => m.wants_to_play !== "not_now") && (
+      <>
+        <h2>Waiting to be placed</h2>
+        <p class="muted">
+          New club members with no league entry yet who want to play, or have not said. Members taking a break,
+          leaving, previously entered or social are not listed. Consider these members in the draft for next season,
+          on the <a href="/coach/season">Season</a> tab; each draft offers them only for what they want to play.
+        </p>
+        <div class="card">
+          <ul class="list">
+            {waiting.filter((m) => m.wants_to_play !== "not_now").map((m) => (
+              <li class="answer">
+                <a href={`/coach/members/${m.id}`}>{m.display_name}</a>
+                {m.level !== null && <span class="tag level">Level {m.level}</span>}
+                <span class="tag">{m.wants_to_play ? playsLabel(m.wants_to_play) : "Not said what they play"}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      </>
+    )}
+    {waiting && waiting.some((m) => m.wants_to_play === "not_now") && (
+      <p class="muted">
+        {plural(waiting.filter((m) => m.wants_to_play === "not_now").length, "social member is", "social members are")}{" "}
+        not waiting for a place. Open one to change that if they ask to play.
+      </p>
+    )}
+    <h2>On the club's list</h2>
+    <form class="search" method="get" action="/coach/members">
+      {unsigned && <input type="hidden" name="show" value="unsigned" />}
+      <label for="q">Find a member</label>
+      <input id="q" name="q" type="search" value={query} placeholder="Name, email or telephone" />
+      <button class="small" type="submit">Find</button>
+      {query && <a href={unsigned ? "/coach/members?show=unsigned" : "/coach/members"}>Clear</a>}
+    </form>
+    <p class="muted">
+      Open a member to make them a sign-in link, change their details, or record a break or that they have left.
+      {emailConfigured ? " To email invitations to several at once, select up to five below. Emailed links work once, for seven days; provider acceptance does not confirm inbox delivery."
+        : " Email is not configured, so invitations cannot be emailed; you can still hand over sign-in links."}
+    </p>
+    {emailConfigured && <form id="invitations" method="post" action="/coach/members/invite">
+      <button type="submit">Email selected members (up to 5)</button>
+    </form>}
+    {unsigned ? (
+      <p>
+        <strong>Placed but never signed in ({members.length}).</strong> In a competition under way or being drafted, and
+        never signed in. <a href="/coach/members">Show everyone</a>
+      </p>
+    ) : (
+      total > 0 && (
+        <p class="muted">
+          {signedIn} of {total} signed in. Those not signed in yet are listed first. Levels run from 10, a beginner,
+          to 1, a national player.{" "}
+          <a href="/coach/members?show=unsigned">Show only those placed but never signed in</a>
+        </p>
+      )
+    )}
+    {query && <p class="muted">{plural(members.length, "member")} matching "{query}".</p>}
+    {members.length === 0 ? (
+      <p class="muted">{query ? "Nobody matches. Check the spelling, or search by email or telephone." : unsigned ? "Everyone placed has signed in." : "The club has no members yet."}</p>
+    ) : (
+      <div class="card">
+        <ul class="list">
+          {members.map((m) => (
+            <li class="answer" id={`member-${m.id}`}>
+              <div class="answer-row">
+                <span>
+                  <a href={`/coach/members/${m.id}`}>{m.display_name}</a>
+                  {m.level !== null && <span class="tag level">Level {m.level}</span>}
+                  {m.status === "paused" && <span class="tag">On a break</span>}
+                  {m.leaving_at && <span class="tag">Not playing next season</span>}
+                  {m.wants_to_play === "not_now" && <span class="tag">Social</span>}
+                  <br />
+                  {m.signed_in_at ? (
+                    <span class="muted">Signed in {at(m.signed_in_at, timezone)}</span>
+                  ) : (
+                    <span class="deadline">Not signed in yet</span>
+                  )}
+                  {unusedLink(m) && <span class="deadline"> · emailed link not used</span>}
+                </span>
+                {emailConfigured && m.email && <label class="muted"><input type="checkbox" name="member" value={m.id} form="invitations" /> Email</label>}
+              </div>
+            </li>
+          ))}
+        </ul>
+      </div>
+    )}
+    {left.length > 0 && (
+      <>
+        <h2 id="former">Former members ({left.length})</h2>
+        <p class="muted">
+          Their scores stay in past tables. They are left out of next season's draft and cannot be entered in a
+          competition. If one comes back, put them back in the club. If one asks for their personal data to be
+          deleted, erase them: their results stay, under "Erased member".
+        </p>
+        <div class="card">
+          <ul class="list">
+            {left.map((m) => (
+              <li class="answer" id={`member-${m.id}`}>
+                <div class="answer-row">
+                  <a href={`/coach/members/${m.id}`}>{m.display_name}</a>
+                  <span class="actions">
+                    <form method="post" action={`/coach/members/${m.id}/back`}>
+                      <button class="quiet small" type="submit">
+                        Back in the club
+                      </button>
+                    </form>
+                    <a class="button small quiet" href={`/coach/members/${m.id}/erase`}>
+                      Erase…
+                    </a>
+                  </span>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </div>
+      </>
+    )}
+  </Layout>
+);
+
+/**
+ * One member, with everything the coach can do for them. Its heading names them, so every form on the page is
+ * plainly theirs, and each saves back here.
+ */
+export const MemberPage: FC<{
+  frame: Frame;
+  member: CoachMember;
+  saved: boolean;
+  emailConfigured: boolean;
+  timezone: string;
+}> = ({ frame, member: m, saved, emailConfigured, timezone }) => (
+  <Layout title={m.display_name} frame={frame}>
+    <p class="jump"><a href="/coach/members">← All members</a></p>
+    <h1>{m.display_name}</h1>
+    {saved && <div class="notice ok" role="status">Saved.</div>}
+    <p>
+      {m.level !== null && <span class="tag level">Level {m.level}</span>}
+      {m.status === "paused" && <span class="tag">On a break</span>}
+      {m.status === "left" && <span class="tag">Left the club</span>}
+      {m.email && <span class="muted"> {m.email}</span>}
+      {m.phone && <span class="muted"> · {m.phone}</span>}
+      <br />
+      {m.signed_in_at ? (
+        <span class="muted">Signed in {at(m.signed_in_at, timezone)}</span>
+      ) : (
+        <span class="deadline">Not signed in yet</span>
+      )}
+    </p>
+    {m.status === "left" ? (
+      <>
+        <p class="muted">
+          Their scores stay in past tables. They are left out of next season's draft and cannot be entered in a
+          competition. If they come back, put them back in the club. If they ask for their personal data to be
+          deleted, erase them: their results stay, under "Erased member".
+        </p>
+        <form method="post" action={`/coach/members/${m.id}/back`}>
+          <button class="quiet small" type="submit">Back in the club</button>
+        </form>
+        <p><a class="button small quiet" href={`/coach/members/${m.id}/erase`}>Erase…</a></p>
+      </>
+    ) : (
+      <>
+        <h2>Signing in</h2>
+        <p class="muted">A link works once, within seven days. Once signed in, a player stays signed in on that phone.</p>
+        {m.invitation_state && <p class={m.invitation_state === "failed" ? "deadline" : "muted"}>
+          {m.invitation_state === "accepted" ? "Email accepted for sending; inbox delivery not confirmed" : "Email attempt failed; check contacts and provider, then retry"}
+          {m.invitation_at && ` · ${at(m.invitation_at, timezone)}`}
+        </p>}
+        {unusedLink(m) && <p class="deadline">
+          Link sent, not used: it ran out seven days after sending. Email another, or make a sign-in
+          link to send another way.
+        </p>}
+        <form method="post" action={`/coach/members/${m.id}/sign-in-link`}>
+          <button class="quiet small" type="submit">Sign-in link</button>
+        </form>
+        {emailConfigured && m.email && <form method="post" action={`/coach/members/${m.id}/invite`}>
+          <button class="small" type="submit">Email sign-in link</button>
+        </form>}
+        <h2>Details</h2>
+        {m.email !== undefined && <form class="approve" method="post" action={`/coach/members/${m.id}/contacts`}>
+          <div class="field"><label for={`email-${m.id}`}>Email for sign-in links</label>
+            <input id={`email-${m.id}`} type="email" name="email" value={m.email ?? ""} maxlength={254} /></div>
+          <div class="field"><label for={`phone-${m.id}`}>Telephone for WhatsApp</label>
+            <input id={`phone-${m.id}`} type="tel" name="phone" value={m.phone ?? ""} maxlength={24} /></div>
+          <button class="quiet small" type="submit">Save contacts</button>
+        </form>}
+        <form class="level" method="post" action={`/coach/members/${m.id}/name`}>
+          <label class="muted" for={`name-${m.id}`}>Name shown to players</label>
+          <input id={`name-${m.id}`} name="display_name" maxlength={60} value={m.display_name} required />
+          <button class="quiet small" type="submit">Save</button>
+        </form>
+        <form class="level" method="post" action={`/coach/members/${m.id}/level`}>
+          <label class="muted" for={`level-${m.id}`}>Level</label>
+          <LevelSelect id={`level-${m.id}`} value={m.level} />
+          <button class="quiet small" type="submit">Save</button>
+        </form>
+        <p class="muted">Levels run from 10, a beginner, to 1, a national player.</p>
+        <form class="level" method="post" action={`/coach/members/${m.id}/plays`}>
+          <PlaysSelect id={`plays-${m.id}`} value={m.wants_to_play ?? null} />
+          <button class="quiet small" type="submit">Save</button>
+        </form>
+        {m.gender !== undefined && (
+          <form class="approve" method="post" action={`/coach/members/${m.id}/details`}>
+            <PersonSelects id={m.id} gender={m.gender} ageGroup={m.age_group ?? null} />
+            <button class="quiet small" type="submit">Save</button>
+          </form>
+        )}
+        <h2>Playing</h2>
+        {m.status === "paused" ? (
+          <form method="post" action={`/coach/members/${m.id}/resume`}>
+            <span class="deadline">On a break</span>
+            <span class="muted"> · out of every draft until they are back · </span>
+            <button class="quiet small" type="submit">Back from a break</button>
+          </form>
+        ) : (
+          <form method="post" action={`/coach/members/${m.id}/pause`}>
+            <button class="quiet small" type="submit">Take a break</button>
+            <span class="muted">
+              {" "}Out of every draft until they are back. Their matches this season stay, and still count.
+            </span>
+          </form>
+        )}
+        {m.leaving_at ? (
+          <form method="post" action={`/coach/members/${m.id}/staying`}>
+            <span class="deadline">Not playing next season at all</span>
+            <span class="muted"> · since {at(m.leaving_at, timezone)} · </span>
+            <button class="quiet small" type="submit">Take it back</button>
+          </form>
+        ) : (
+          <form method="post" action={`/coach/members/${m.id}/leaving`}>
+            <button class="quiet small" type="submit">Not playing next season</button>
+            <span class="muted">
+              {" "}Out of next season's drafts, singles and doubles. Their matches this season stay, and still count.
+            </span>
+          </form>
+        )}
+        <p>
+          <a class="button small quiet" href={`/coach/members/${m.id}/left`}>Left the club…</a>
+          <span class="muted"> Asks first. Their results stay; they are not placed again, nor sent new sign-in links.</span>
+        </p>
+      </>
+    )}
+  </Layout>
+);
+
+export const SignInLink: FC<{ frame: Frame; member: string; memberId: string; url: string; days: number }> = ({
+  frame,
+  member,
+  memberId,
+  url,
+  days,
+}) => (
+  <Layout title="Sign-in link" frame={frame}>
+    <h1>Sign-in link for {member}</h1>
+    <p>
+      Send this to {member}. It works once, within {days} days, and is not shown again: make a new one if it runs
+      out.
+    </p>
+    <div class="field">
+      <label for="link">Link</label>
+      <input id="link" type="text" value={url} readonly />
+    </div>
+    <p class="muted">
+      Opening it in this browser signs this browser in as {member}. To try it as the player yourself, open it in a
+      private window.
+    </p>
+    <p class="jump">
+      <a href={`/coach/members/${memberId}`}>Back to {member}</a>
+      <a href="/coach/members">All members</a>
+    </p>
+  </Layout>
+);
+
+/** A court the forecast is for, as the API gives it. */
+export type CourtLocation = { id: string; name: string; latitude: number; longitude: number };
+
+export type WeatherUnits = "uk" | "metric" | "us";
+
+export type WeatherSettings = { units: WeatherUnits; court_locations: CourtLocation[] };
+
+/** The most courts the players' home page shows, and so the most the API keeps. */
+export const MAX_COURTS = 8;
+
+const UNIT_CHOICES: { units: WeatherUnits; label: string }[] = [
+  { units: "uk", label: "°C, wind in mph" },
+  { units: "metric", label: "°C, wind in km/h" },
+  { units: "us", label: "°F, wind in mph" },
+];
+
+/** "51.4343, -0.2141": how a map copies a place, and how the coach pastes one. */
+export const coordinatesOf = (c: { latitude: number; longitude: number }) => `${c.latitude}, ${c.longitude}`;
+
+const mapHref = (c: CourtLocation) =>
+  `https://www.openstreetmap.org/?mlat=${c.latitude}&mlon=${c.longitude}#map=17/${c.latitude}/${c.longitude}`;
+
+/** A form the coach sent that was not accepted: what they typed, to try again, and why. */
+export type Refused = { court: string | null; name: string; coordinates: string; message: string };
+
+const CourtFields: FC<{ id: string; name: string; coordinates: string }> = ({ id, name, coordinates }) => (
+  <>
+    <div class="field">
+      <label for={`name-${id}`}>Name</label>
+      <input id={`name-${id}`} name="name" maxlength={100} value={name} required />
+    </div>
+    <div class="field">
+      <label for={`where-${id}`}>Latitude, longitude</label>
+      <input id={`where-${id}`} name="coordinates" inputmode="decimal" autocomplete="off" placeholder="51.4343, -0.2141"
+        value={coordinates} required />
+    </div>
+  </>
+);
+
+export const Weather: FC<{
+  frame: Frame;
+  settings: WeatherSettings;
+  /** The forecast as players see it on their home page; null when it could not be had in time. */
+  forecast: { venues: VenueForecast[]; lastDay: string | null } | null;
+  /** What the last change did. */
+  done: string | null;
+  refused: Refused | null;
+}> = ({ frame, settings, forecast, done, refused }) => {
+  const courts = settings.court_locations;
+  const typed = (court: string | null) => (refused && refused.court === court ? refused : null);
+  return (
+    <Layout title="Weather" frame={frame}>
+      <h1>Weather</h1>
+      {done && (
+        <div class="notice ok" role="status">
+          {done}
+        </div>
+      )}
+      {refused && (
+        <div class="notice" role="alert">
+          {refused.message}
+        </div>
+      )}
+      <p>
+        The players' home page shows a 14-day forecast for each court here, from Open-Meteo. With no courts, it shows
+        none.
+      </p>
+      {forecast?.venues.length ? (
+        <WeatherBox venues={forecast.venues} lastDay={forecast.lastDay} />
+      ) : (
+        courts.length > 0 && <p class="muted">The forecast could not be fetched just now. Players see the page without it.</p>
+      )}
+
+      <h2>
+        Courts ({courts.length} of {MAX_COURTS})
+      </h2>
+      <p class="muted">
+        To find a court's latitude and longitude, right-click it in Google Maps and click the numbers at the top of the
+        menu to copy them, then paste them here.
+      </p>
+      {courts.length === 0 && <p class="muted">No courts yet, so players see no forecast.</p>}
+      {courts.map((c) => {
+        const retry = typed(c.id);
+        return (
+          <div class="card" id={`court-${c.id}`}>
+            <form class="court" method="post" action={`/coach/weather/courts/${c.id}`}>
+              <CourtFields id={c.id} name={retry?.name ?? c.name} coordinates={retry?.coordinates ?? coordinatesOf(c)} />
+              <button class="quiet small" type="submit">
+                Save
+              </button>
+            </form>
+            <div class="court-foot">
+              <a href={mapHref(c)} rel="noreferrer">
+                Check on the map
+              </a>
+              <form method="post" action={`/coach/weather/courts/${c.id}/delete`}>
+                <button class="quiet small" type="submit">
+                  Remove
+                </button>
+              </form>
+            </div>
+          </div>
+        );
+      })}
+
+      {courts.length < MAX_COURTS ? (
+        <>
+          <h2>Add a court</h2>
+          <div class="card" id="add">
+            <form class="court" method="post" action="/coach/weather/courts">
+              <CourtFields id="new" name={typed(null)?.name ?? ""} coordinates={typed(null)?.coordinates ?? ""} />
+              <button class="small" type="submit">
+                Add
+              </button>
+            </form>
+          </div>
+        </>
+      ) : (
+        <p class="muted">That is the most the home page shows. Remove one to add another.</p>
+      )}
+
+      <h2>Units</h2>
+      <form class="level" method="post" action="/coach/weather/units" id="units">
+        <label class="muted" for="units-select">
+          Show
+        </label>
+        <select id="units-select" name="units">
+          {UNIT_CHOICES.map((u) => (
+            <option value={u.units} selected={settings.units === u.units}>
+              {u.label}
+            </option>
+          ))}
+        </select>
+        <button class="quiet small" type="submit">
+          Save
+        </button>
+      </form>
+    </Layout>
+  );
+};
+
+export const Problem: FC<{ frame: Frame; title: string; detail: string; back?: { href: string; label: string } }> = ({
+  frame,
+  title,
+  detail,
+  back = { href: "/coach/members", label: "Back to members" },
+}) => (
+  <Layout title={title} frame={frame}>
+    <h1>{title}</h1>
+    <p>{detail}</p>
+    <p>
+      <a href={back.href}>{back.label}</a>
+    </p>
+  </Layout>
+);
+
+export const InvitationResults: FC<{ frame: Frame; results: { name: string; message: string }[]; added?: string;
+  /** The one member invited, when there was one: the page goes back to them. */
+  memberId?: string }> = ({ frame, results, added, memberId }) => (
+  <Layout title="Sign-in invitations" frame={frame}>
+    <h1>Sign-in invitations</h1>
+    {added && <p>{added} is now a member, waiting for next season's placement. Approval succeeded even if the email failed.</p>}
+    <ul>{results.map((r) => <li><strong>{r.name}</strong>: {r.message}</li>)}</ul>
+    {memberId
+      ? <p class="jump"><a href={`/coach/members/${memberId}`}>Back to {added ?? results[0]?.name ?? "the member"}</a> <a href="/coach/members">All members</a></p>
+      : <p><a href="/coach/members">Return to Members to check contacts, retry an invitation or see who has signed in.</a></p>}
+  </Layout>
+);
+
+/**
+ * Erasing a former member, asked first with the administrator key: it cannot be undone, and this browser's own
+ * key is not allowed to do it. The key is used for this one request and not kept.
+ */
+export const ConfirmErase: FC<{ frame: Frame; member: CoachMember; message?: string }> = ({ frame, member, message }) => (
+  <Layout title={`Erase ${member.display_name}?`} frame={frame}>
+    <h1>Erase {member.display_name}?</h1>
+    <Notice message={message} />
+    <p>For when someone asks for their personal data to be deleted. This cannot be undone.</p>
+    <ul class="plain">
+      <li>Their name, email, phone, date of birth, notes and level are deleted.</li>
+      <li>Their matches and scores stay, so every table still adds up. Other players see them as "Erased member".</li>
+      <li>A team name that could name them, and anything they typed when reporting a score, is cleared.</li>
+      <li>They come off Former members and cannot be brought back. If they rejoin, they start as a new member.</li>
+    </ul>
+    <form method="post" action={`/coach/members/${member.id}/erase`}>
+      <input type="hidden" name="confirm" value="yes" />
+      <div class="field">
+        <label for="key">Administrator key</label>
+        <input id="key" name="key" type="password" autocomplete="off" required />
+        <p class="muted">The key the installer showed you. It is used for this once and not kept.</p>
+      </div>
+      <button type="submit">Erase {member.display_name}</button>
+    </form>
+    <p class="after">
+      <a href={`/coach/members/${member.id}`}>No, back to {member.display_name}</a>
+    </p>
+  </Layout>
+);
+
+/** Emptying a contact field clears it: asked first, since an empty box is easy to send by mistake. */
+export const ConfirmClearContacts: FC<{ frame: Frame; member: CoachMember; email: string; phone: string; clearing: string[] }> = ({
+  frame, member, email, phone, clearing,
+}) => {
+  const what = clearing.join(" and ");
+  return (
+    <Layout title={`Clear ${member.display_name}'s ${what}?`} frame={frame}>
+      <h1>Clear {member.display_name}'s {what}?</h1>
+      <ul class="plain">
+        {clearing.includes("email address") && <li>Without an email address they cannot be emailed a sign-in link; you can still make one to send another way.</li>}
+        {clearing.includes("telephone number") && <li>Their partner and opponents will not see a telephone number for them.</li>}
+        {email && <li>Their email address will be {email}.</li>}
+        {phone && <li>Their telephone number will be {phone}.</li>}
+      </ul>
+      <form method="post" action={`/coach/members/${member.id}/contacts`}>
+        <input type="hidden" name="confirm" value="yes" />
+        <input type="hidden" name="email" value={email} />
+        <input type="hidden" name="phone" value={phone} />
+        <button type="submit">Yes, clear the {what}</button>
+      </form>
+      <p class="after">
+        <a href={`/coach/members/${member.id}`}>No, back to {member.display_name}</a>
+      </p>
+    </Layout>
+  );
+};
+
+/** Leaving the club, asked first: what it does to this season, next season and signing in. */
+export const ConfirmLeft: FC<{ frame: Frame; member: CoachMember }> = ({ frame, member }) => (
+  <Layout title={`${member.display_name} has left the club?`} frame={frame}>
+    <h1>{member.display_name} has left the club?</h1>
+    <ul class="plain">
+      <li>Their matches this season stay as they are: results already in still count, and you can still decide the rest.</li>
+      <li>They are taken out of next season's drafts and cannot be entered in a competition.</li>
+      <li>Any sign-in link not yet used stops working, and you cannot make them another.</li>
+      <li>They move to Former members at the foot of Members, where you can bring them back.</li>
+    </ul>
+    <p class="muted">
+      Away for a while, or just not playing next season? Use Take a break or Not playing next season instead: they stay
+      on the club's list.
+    </p>
+    <form method="post" action={`/coach/members/${member.id}/left`}>
+      <input type="hidden" name="confirm" value="yes" />
+      <button type="submit">Yes, {member.display_name} has left</button>
+    </form>
+    <p class="after">
+      <a href={`/coach/members/${member.id}`}>No, back to {member.display_name}</a>
+    </p>
+  </Layout>
+);
